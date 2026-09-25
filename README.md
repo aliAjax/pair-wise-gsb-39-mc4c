@@ -19,6 +19,7 @@ python app.py --port 8010
 - 班次时间以服务日零点起算，允许超过 1440 分钟。例如 1430 分发车、21 分钟到达会显示为次日 `00:21`。
 - 修改只允许发生在草稿版本；创建新版本会复制父版本变更，已发布快照继续保留。
 - 发布在一个 SQLite 事务内写入方案快照和 SHA-256，旧发布版本不会被覆盖。
+- 接驳计划台（`/shuttle.html`）：为草稿版本登记站点人数需求，再安排接驳班次的车组、服务时段和载客量。同一车组时段重叠、站点没人覆盖或单班容量不够时班次留在待确认并写明缺口；发布时只把已确认班次写进快照，规则（`shuttle_rules.py`）、保存（`shuttle_store.py`）和页面分开。
 
 ## API
 
@@ -32,6 +33,9 @@ python app.py --port 8010
 - `GET /api/route?from=1&to=5&version_id=1&at_minute=1430&accessible=true`：查询路径、耗时和到达时间。
 - `GET /api/trips/{id}`：查看跨日班次各站时间。
 - `GET /api/import-errors`：查看被隔离的错误批次。
+- `POST /api/versions/{id}/shuttle-demands`：登记或更新站点人数需求（仅草稿，同站点覆盖人数）。
+- `POST /api/versions/{id}/shuttle-shifts`：安排接驳班次（仅草稿），保存后自动重算整个版本的车组重叠和容量冲突。
+- `GET /api/versions/{id}/shuttle-coverage`：按版本查看需求覆盖、待确认班次和站点缺口，已发布版本可随时回看。
 
 ## 测试
 
@@ -39,4 +43,4 @@ python app.py --port 8010
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖基线/改道路径、版本复制与发布隔离、审批冲突、无障碍路径、跨日时刻和坏数据整批隔离。
+测试覆盖基线/改道路径、版本复制与发布隔离、审批冲突、无障碍路径、跨日时刻和坏数据整批隔离；接驳部分覆盖需求登记与重算、车组时段重叠、容量缺口、无人覆盖缺口、发布快照只含已确认班次、版本复制隔离和重开后按版本查看。

@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>接驳计划台</title>
+<style>
+body{font:15px/1.5 system-ui,sans-serif;max-width:1080px;margin:32px auto;padding:0 18px}
+input,select,button{padding:7px;margin:3px}
+.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}
+table{border-collapse:collapse;width:100%;margin-top:8px}
+th,td{border:1px solid #e1e7ec;padding:6px 8px;text-align:left;font-size:14px}
+.badge{padding:2px 10px;border-radius:10px;font-size:13px;white-space:nowrap}
+.ok{background:#e3f5e9;color:#17693a}.warn{background:#fdecea;color:#a32a1f}
+.gap{color:#a32a1f;margin:4px 0}pre{background:#f5f7f9;padding:12px;overflow:auto}button{cursor:pointer}small{color:#667}
+</style></head>
+<body>
+<h1>临时接驳计划台</h1>
+<p>先为草稿版本登记站点人数需求，再安排接驳班次的车组、服务时段和载客量，按停运形成的站点缺口覆盖。同一车组时段重叠、站点没人覆盖或单班容量不够时，班次留在<strong>待确认</strong>并写明缺口；版本发布时只把已确认班次写进快照，草稿再改只影响新版本。<a href="/index.html">返回改道发布</a></p>
+
+<div class="card"><h2>身份与版本</h2>
+<input id="user" value="planner-01">
+<select id="role"><option>planner</option><option>editor</option><option>reviewer</option><option>admin</option></select>
+<label>中断事件 <select id="disruption" onchange="fillVersions();loadCoverage()"></select></label>
+<label>版本 <select id="version" onchange="loadCoverage()"></select></label>
+<button onclick="loadAll()">刷新</button><small id="versionState"></small>
+</div>
+
+<div class="card"><h2>登记站点人数需求</h2>
+<label>站点 <select id="demandStop"></select></label>
+<label>需求人数 <input id="demandHead" type="number" min="1" value="60"></label>
+<button onclick="saveDemand()">登记/更新</button>
+<small>同一站点重复登记会覆盖人数；被 stop_closure 停运的站点会标记为停运缺口。</small>
+</div>
+
+<div class="card"><h2>安排接驳班次</h2>
+<label>车组 <input id="crew" value="车组A"></label>
+<label>站点 <select id="shiftStop"></select></label>
+<label>开始分钟 <input id="start" type="number" min="0" value="1320"></label>
+<label>结束分钟 <input id="end" type="number" min="1" value="1560"></label>
+<label>载客量 <input id="capacity" type="number" min="1" value="45"></label>
+<button onclick="saveShift()">安排班次</button>
+<small>分钟从服务日零点起算，可超过 1440（如 1500 = 次日 01:00）。每次保存后自动重算整个版本的冲突。</small>
+</div>
+
+<div class="card"><h2>覆盖情况 <span id="planBadge"></span></h2>
+<div id="gaps"></div>
+<h3>站点需求</h3><div id="demands"></div>
+<h3>接驳班次</h3><div id="shifts"></div>
+</div>
+
+<div class="card"><h2>已发布快照</h2><button onclick="showSnapshot()">查看当前版本快照</button><pre id="snapshot">仅已发布版本有快照。</pre></div>
+
+<script>
+const el=id=>document.getElementById(id);
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const auth=()=>({'Content-Type':'application/json','X-User':el('user').value,'X-Role':el('role').value});
+async function call(url,opts={}){const r=await fetch(url,opts);const j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}
+async function post(url,body){return call(url,{method:'POST',headers:auth(),body:JSON.stringify(body)})}
+let stopsCache=[],versionsCache=[];
+function stopOptions(){return stopsCache.map(s=>`<option value="${s.id}">${esc(s.code)} ${esc(s.name)}</option>`).join('')}
+async function loadAll(){
+  try{
+    const [disruptions,versions,stops]=await Promise.all([call('/api/disruptions'),call('/api/versions'),call('/api/stops')]);
+    stopsCache=stops.items;versionsCache=versions.items;
+    el('demandStop').innerHTML=stopOptions();
+    el('shiftStop').innerHTML=stopOptions();
+    el('disruption').innerHTML=disruptions.items.map(d=>`<option value="${d.id}">${esc(d.code)} ${esc(d.name)}</option>`).join('');
+    fillVersions();
+    await loadCoverage();
+  }catch(e){el('gaps').textContent=e.message}
+}
+function fillVersions(){
+  const did=Number(el('disruption').value);
+  const list=versionsCache.filter(v=>v.disruption_id===did);
+  el('version').innerHTML=list.map(v=>`<option value="${v.id}">v${v.version_no} · ${esc(v.status)}</option>`).join('');
+}
+async function loadCoverage(){
+  const vid=el('version').value;
+  if(!vid){el('gaps').textContent='请先在改道发布页创建中断事件和草稿版本。';return}
+  try{render(await call('/api/versions/'+vid+'/shuttle-coverage'))}catch(e){el('gaps').textContent=e.message}
+}
+async function saveDemand(){
+  try{render(await post('/api/versions/'+el('version').value+'/shuttle-demands',{stop_id:Number(el('demandStop').value),headcount:Number(el('demandHead').value)}))}catch(e){el('gaps').textContent=e.message}
+}
+async function saveShift(){
+  try{render(await post('/api/versions/'+el('version').value+'/shuttle-shifts',{crew:el('crew').value,stop_id:Number(el('shiftStop').value),start_minute:Number(el('start').value),end_minute:Number(el('end').value),capacity:Number(el('capacity').value)}))}catch(e){el('gaps').textContent=e.message}
+}
+function render(r){
+  el('versionState').textContent='版本状态：'+r.version_status;
+  el('planBadge').innerHTML=r.plan_status==='confirmed'?'<span class="badge ok">已确认</span>':'<span class="badge warn">待确认</span>';
+  el('gaps').innerHTML=r.gaps.length?r.gaps.map(g=>`<div class="gap">缺口：${esc(g)}</div>`).join(''):'<small>所有登记需求均有已确认班次覆盖。</small>';
+  el('demands').innerHTML='<table><tr><th>站点</th><th>需求人数</th><th>停运缺口</th><th>覆盖</th><th>已确认班次数</th></tr>'
+    +r.demands.map(d=>`<tr><td>${esc(d.stop_code)} ${esc(d.stop_name)}</td><td>${d.headcount}</td><td>${d.closed?'是':'否'}</td><td>${d.covered?'<span class="badge ok">已覆盖</span>':'<span class="badge warn">缺 '+d.gap_headcount+' 人</span>'}</td><td>${d.confirmed_shifts}</td></tr>`).join('')+'</table>';
+  el('shifts').innerHTML='<table><tr><th>#</th><th>车组</th><th>站点</th><th>服务时段</th><th>载客量</th><th>状态</th><th>缺口说明</th></tr>'
+    +r.shifts.map(s=>`<tr><td>${s.id}</td><td>${esc(s.crew)}</td><td>${esc(s.stop_code)} ${esc(s.stop_name)}</td><td>${esc(s.start_clock)}–${esc(s.end_clock)}（${s.start_minute}-${s.end_minute} 分钟）</td><td>${s.capacity}</td><td>${s.status==='confirmed'?'<span class="badge ok">已确认</span>':'<span class="badge warn">待确认</span>'}</td><td>${esc(s.note||'')}</td></tr>`).join('')+'</table>';
+}
+async function showSnapshot(){
+  try{
+    const v=await call('/api/versions/'+el('version').value);
+    el('snapshot').textContent=v.snapshot?JSON.stringify(v.snapshot.shuttle,null,2):'该版本尚未发布，没有快照。';
+  }catch(e){el('snapshot').textContent=e.message}
+}
+loadAll();
+</script></body></html>

@@ -14,6 +14,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from shuttle_rules import RuleViolation
+from shuttle_store import ShuttleStore
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "transit_disruption.db"
 
@@ -51,6 +54,7 @@ class DomainError(Exception):
 class Database:
     def __init__(self, path: str | os.PathLike[str] = DEFAULT_DB):
         self.path = str(path)
+        self.shuttle = ShuttleStore(self)
         self._init_schema()
 
     def connect(self) -> sqlite3.Connection:
@@ -151,6 +155,7 @@ class Database:
                 );
                 """
             )
+            self.shuttle.init_schema(conn)
 
     def _audit(self, conn: sqlite3.Connection, actor: str, action: str, entity_type: str,
                entity_id: int | None, details: dict[str, Any]) -> None:
@@ -291,6 +296,7 @@ class Database:
                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (new_id, change["kind"], change["line_id"], change["stop_id"], change["from_stop_id"], change["to_stop_id"], change["travel_minutes"], change["effective_start_minute"], change["effective_end_minute"], change["accessible"], change["payload"], utcnow()),
                 )
+            self.shuttle.copy_to_version(conn, parent_id, new_id)
             self._audit(conn, actor, "version.copied", "version", new_id, {"parent_id": parent_id})
             return dict(conn.execute("SELECT * FROM versions WHERE id=?", (new_id,)).fetchone())
 
@@ -346,6 +352,24 @@ class Database:
             self._audit(conn, actor, "change.added", "version", version_id, {"kind": kind, "change_id": cur.lastrowid})
             return dict(conn.execute("SELECT * FROM changes WHERE id=?", (cur.lastrowid,)).fetchone())
 
+    def add_shuttle_demand(self, version_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
+        try:
+            return self.shuttle.add_demand(version_id, actor, payload, role)
+        except RuleViolation as exc:
+            raise DomainError(str(exc), exc.status) from exc
+
+    def add_shuttle_shift(self, version_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
+        try:
+            return self.shuttle.add_shift(version_id, actor, payload, role)
+        except RuleViolation as exc:
+            raise DomainError(str(exc), exc.status) from exc
+
+    def shuttle_coverage(self, version_id: int) -> dict[str, Any]:
+        try:
+            return self.shuttle.coverage(version_id)
+        except RuleViolation as exc:
+            raise DomainError(str(exc), exc.status) from exc
+
     def transition(self, version_id: int, actor: str, role: str, action: str) -> dict[str, Any]:
         if role not in {"planner", "editor", "reviewer", "admin"}:
             raise DomainError("没有状态流转权限", 403)
@@ -375,7 +399,7 @@ class Database:
                 if status != "approved" or role not in {"reviewer", "admin"}:
                     raise DomainError("只有已批准版本可以发布", 409)
                 changes = [dict(r) for r in conn.execute("SELECT kind,line_id,stop_id,from_stop_id,to_stop_id,travel_minutes,effective_start_minute,effective_end_minute,accessible,payload FROM changes WHERE version_id=? ORDER BY id", (version_id,)).fetchall()]
-                snapshot = {"version_id": version_id, "disruption_id": version["disruption_id"], "version_no": version["version_no"], "changes": changes, "base_hash": self._base_hash(conn)}
+                snapshot = {"version_id": version_id, "disruption_id": version["disruption_id"], "version_no": version["version_no"], "changes": changes, "base_hash": self._base_hash(conn), "shuttle": self.shuttle.snapshot_payload(conn, version_id)}
                 snapshot_text = canonical(snapshot)
                 digest = hashlib.sha256(snapshot_text.encode()).hexdigest()
                 conn.execute("UPDATE versions SET status='published',snapshot_hash=?,snapshot=?,published_at=?,updated_at=? WHERE id=?", (digest, snapshot_text, utcnow(), utcnow(), version_id))
@@ -589,8 +613,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _html(self) -> None:
-        data = (ROOT / "static" / "index.html").read_bytes()
+    def _html(self, name: str = "index.html") -> None:
+        data = (ROOT / "static" / name).read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
@@ -614,6 +638,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if parsed.path in {"/", "/index.html"}:
                 return self._html()
+            if parsed.path == "/shuttle.html":
+                return self._html("shuttle.html")
             if parsed.path == "/api/health":
                 return self._send({"ok": True})
             endpoints = {
@@ -632,6 +658,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(self.db.get_version(int(parts[2])))
             if len(parts) == 3 and parts[:2] == ["api", "trips"]:
                 return self._send({"times": self.db.trip_times(int(parts[2]))})
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "shuttle-coverage":
+                return self._send(self.db.shuttle_coverage(int(parts[2])))
             if parsed.path == "/api/route":
                 q = parse_qs(parsed.query)
                 version = q.get("version_id", [None])[0]
@@ -657,6 +685,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(self.db.add_change(int(body.get("version_id")), actor, body, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "changes":
                 return self._send(self.db.add_change(int(parts[2]), actor, body, role), 201)
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "shuttle-demands":
+                return self._send(self.db.add_shuttle_demand(int(parts[2]), actor, body, role), 201)
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "shuttle-shifts":
+                return self._send(self.db.add_shuttle_shift(int(parts[2]), actor, body, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] in {"submit", "approve", "reject", "publish"}:
                 return self._send(self.db.transition(int(parts[2]), actor, role, parts[3]))
             raise DomainError("接口不存在", 404)
