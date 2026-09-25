@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>临时接驳计划台</title>
+<style>
+body{font:15px/1.5 system-ui,sans-serif;max-width:1180px;margin:32px auto;padding:0 18px;color:#22303c}
+input,select,button{padding:7px;margin:3px;font:inherit}
+.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}
+table{border-collapse:collapse;width:100%;margin:8px 0}
+th,td{border:1px solid #e3e9ee;padding:6px 8px;text-align:left;vertical-align:top}
+th{background:#f5f7f9}
+.badge{display:inline-block;padding:2px 9px;border-radius:11px;font-size:13px;white-space:nowrap}
+.ok{background:#e3f4e5;color:#1d6b2a}.pend{background:#fdf0d5;color:#8a5a00}.bad{background:#fde2e1;color:#a31d1d}.mute{background:#eceff1;color:#546e7a}
+.chip{display:inline-block;background:#eef3f7;border:1px solid #d9e1e8;border-radius:8px;padding:3px 9px;margin:2px}
+.stat{display:inline-block;border:1px solid #d9e1e8;border-radius:10px;padding:8px 18px;margin:4px;min-width:110px}
+.stat b{font-size:22px;display:block}
+pre{background:#f5f7f9;padding:12px;overflow:auto}
+small{color:#667}
+button{cursor:pointer}
+.ro{opacity:.55;pointer-events:none}
+</style></head>
+<body>
+<h1>临时接驳计划台</h1>
+<p>按停运造成的站点缺口登记人数需求、安排接驳班次。同一车组时段重叠、站点没人覆盖或单班容量不够的安排会留在<em>待确认</em>并写明缺口；版本发布时只把已确认班次写进快照，草稿再改只影响新版本。<a href="/index.html">改道发布</a></p>
+
+<div class="card"><h2>身份与版本</h2>
+<input id="user" value="planner-01" title="用户">
+<select id="role"><option>planner</option><option>editor</option><option>reviewer</option><option>admin</option></select>
+<select id="versionSel"></select>
+<button onclick="loadAll()">刷新</button>
+<span id="verStatus"></span>
+<div><small>覆盖与缺口只统计已确认班次；分钟从服务日零点起算（如 1080 = 18:00，1500 = 次日 01:00）。</small></div></div>
+
+<div class="card"><h2>停运站点与覆盖总览</h2>
+<div id="affected">—</div>
+<div id="summary"></div>
+<table id="stationTable"><thead><tr><th>站点</th><th>需求人数</th><th>已确认运力</th><th>缺口</th><th>覆盖班次</th><th>状态</th></tr></thead><tbody></tbody></table>
+</div>
+
+<div class="card" id="demandCard"><h2>站点人数需求</h2>
+<form onsubmit="return addDemand()">
+站点 <select id="dStop"></select>
+需求 <input id="dNeeded" type="number" min="1" value="100" style="width:80px"> 人
+时段 <input id="dStart" type="number" min="0" placeholder="起" style="width:80px"> ~ <input id="dEnd" type="number" min="0" placeholder="止" style="width:80px">
+备注 <input id="dNote" placeholder="可选">
+<button type="submit">登记需求</button></form>
+<small>时段留空表示全天。</small>
+<table id="demandTable"><thead><tr><th>站点</th><th>需求</th><th>时段</th><th>备注</th><th>已确认运力</th><th>缺口</th><th>覆盖班次</th><th>状态</th><th></th></tr></thead><tbody></tbody></table>
+</div>
+
+<div class="card" id="tripCard"><h2>接驳班次</h2>
+<form onsubmit="return addTrip()">
+班次 <input id="tLabel" value="接驳-1" style="width:90px">
+车组 <input id="tCrew" value="车组A" style="width:90px">
+时段 <input id="tStart" type="number" min="0" value="1080" style="width:80px"> ~ <input id="tEnd" type="number" min="0" value="1440" style="width:80px">
+载客量 <input id="tCap" type="number" min="1" value="50" style="width:70px"> 人/班
+停靠站 <select id="tStops" multiple size="5" style="vertical-align:top;min-width:140px"></select>
+<button type="submit">安排班次</button></form>
+<table id="tripTable"><thead><tr><th>班次</th><th>车组</th><th>服务时段</th><th>载客量</th><th>停靠站</th><th>状态</th><th>问题</th><th></th></tr></thead><tbody></tbody></table>
+</div>
+
+<div class="card"><h2>待确认与缺口</h2><div id="pending">—</div></div>
+
+<div class="card"><h2>版本流转</h2>
+<button onclick="flow('submit')">提交复核</button>
+<button onclick="flow('approve')">批准</button>
+<button onclick="flow('publish')">发布</button>
+<button onclick="showSnapshot()">查看发布快照</button>
+<pre id="flowOut">已确认计划会在发布时写入快照。</pre></div>
+
+<script>
+let PLAN=null, STOPS=[];
+const $=id=>document.getElementById(id);
+const auth=()=>({'Content-Type':'application/json','X-User':$('user').value,'X-Role':$('role').value});
+async function call(url,opts={}){const r=await fetch(url,opts);const j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmt=m=>{if(m==null)return'全天';const d=Math.floor(m/1440),t=String(Math.floor((m%1440)/60)).padStart(2,'0')+':'+String(m%60).padStart(2,'0');return d===0?t:(d===1?'次日'+t:'+'+d+'日'+t)};
+const range=(s,e)=>fmt(s)+'~'+fmt(e);
+const vid=()=>$('versionSel').value;
+const tripBadge=s=>s==='confirmed'?'<span class="badge ok">已确认</span>':'<span class="badge pend">待确认</span>';
+const stBadge={covered:'<span class="badge ok">已覆盖</span>',partial:'<span class="badge pend">部分覆盖</span>',uncovered:'<span class="badge bad">没人覆盖</span>',no_demand:'<span class="badge bad">未登记需求</span>'};
+
+async function loadAll(){
+  try{
+    const [versions,stops]=await Promise.all([call('/api/versions'),call('/api/stops')]);
+    STOPS=stops.items;
+    const sel=$('versionSel'),keep=sel.value;
+    sel.innerHTML=versions.items.map(v=>`<option value="${v.id}">#${v.id} 事件${v.disruption_id} V${v.version_no} [${v.status}]</option>`).join('');
+    if(keep&&[...sel.options].some(o=>o.value===keep))sel.value=keep;
+    $('dStop').innerHTML=STOPS.map(s=>`<option value="${s.id}">${esc(s.code)} ${esc(s.name)}</option>`).join('');
+    $('tStops').innerHTML=$('dStop').innerHTML;
+    await loadPlan();
+  }catch(e){$('verStatus').textContent=e.message}
+}
+async function loadPlan(){
+  if(!vid())return;
+  try{
+    PLAN=await call('/api/versions/'+vid()+'/shuttle');
+    render();
+  }catch(e){$('verStatus').textContent=e.message}
+}
+function render(){
+  const editable=PLAN.version_status==='draft';
+  $('verStatus').innerHTML=`版本状态 <span class="badge ${editable?'pend':'mute'}">${PLAN.version_status}</span>`+(editable?'':' <small>只读，需新建草稿版本才能修改</small>');
+  $('demandCard').classList.toggle('ro',!editable);
+  $('tripCard').classList.toggle('ro',!editable);
+  $('affected').innerHTML=PLAN.affected_stations.length?PLAN.affected_stations.map(s=>`<span class="chip">${esc(s.code)} ${esc(s.name)} · ${s.kind==='stop_closure'?'停运':'跳站'} · ${range(s.start_minute,s.end_minute)}</span>`).join(''):'<small>该版本没有停运/跳站变更。</small>';
+  const sm=PLAN.summary;
+  $('summary').innerHTML=[['总需求',sm.total_needed+' 人'],['已确认覆盖',sm.total_covered+' 人'],['总缺口',sm.total_gap+' 人'],['班次',`${sm.trips_confirmed}/${sm.trips_total} 已确认`],['待确认需求',sm.demands_pending],['缺口站点',`${sm.stations_with_gap}/${sm.affected_stations}`]].map(([k,v])=>`<span class="stat"><b>${v}</b>${k}</span>`).join('');
+  $('stationTable').querySelector('tbody').innerHTML=PLAN.stations.map(s=>`<tr><td>${esc(s.code)} ${esc(s.name)}</td><td>${s.needed}</td><td>${s.covered}</td><td>${s.gap||'—'}</td><td>${s.covering_labels.map(esc).join('、')||'—'}</td><td>${stBadge[s.status]}</td></tr>`).join('')||'<tr><td colspan="6"><small>无停运站点。</small></td></tr>';
+  $('demandTable').querySelector('tbody').innerHTML=PLAN.demands.map(d=>`<tr><td>${esc(d.stop_code)} ${esc(d.stop_name)}</td><td>${d.needed} 人</td><td>${d.start_minute==null?'全天':range(d.start_minute,d.end_minute)}</td><td>${esc(d.note)}</td><td>${d.covered_capacity}</td><td>${d.gap||'—'}</td><td>${d.covering_labels.map(esc).join('、')||'—'}</td><td>${d.status==='confirmed'?'<span class="badge ok">已覆盖</span>':'<span class="badge pend">待确认</span>'}</td><td><button onclick="delDemand(${d.id})">删除</button></td></tr>`).join('')||'<tr><td colspan="9"><small>还没有登记需求。</small></td></tr>';
+  $('tripTable').querySelector('tbody').innerHTML=PLAN.trips.map(t=>`<tr><td>${esc(t.label)}</td><td>${esc(t.crew)}</td><td>${range(t.start_minute,t.end_minute)}</td><td>${t.capacity}</td><td>${t.stop_names.map(esc).join('、')}</td><td>${tripBadge(t.status)}</td><td>${t.issues.map(i=>esc(i.message)).join('<br>')}</td><td><button onclick="delTrip(${t.id})">删除</button></td></tr>`).join('')||'<tr><td colspan="8"><small>还没有安排班次。</small></td></tr>';
+  const pendTrips=PLAN.trips.filter(t=>t.status!=='confirmed');
+  const pendDemands=PLAN.demands.filter(d=>d.status!=='confirmed');
+  const noDemand=PLAN.stations.filter(s=>s.status==='no_demand');
+  $('pending').innerHTML=(pendTrips.length||pendDemands.length||noDemand.length)?[
+    ...pendTrips.map(t=>`<div>🚌 班次 <b>${esc(t.label)}</b>（${esc(t.crew)}）待确认：${t.issues.map(i=>esc(i.message)).join('；')}</div>`),
+    ...pendDemands.map(d=>`<div>🧍 站点 <b>${esc(d.stop_name)}</b> 需求 ${d.needed} 人待确认：${d.issues.map(i=>esc(i.message)).join('；')}</div>`),
+    ...noDemand.map(s=>`<div>🚉 停运站点 <b>${esc(s.name)}</b> 未登记接驳需求。</div>`)
+  ].join(''):'<span class="badge ok">全部已确认，没有缺口</span>';
+}
+async function addDemand(){
+  try{
+    const body={stop_id:+$('dStop').value,needed:+$('dNeeded').value,note:$('dNote').value};
+    if($('dStart').value!=='')body.start_minute=+$('dStart').value;
+    if($('dEnd').value!=='')body.end_minute=+$('dEnd').value;
+    PLAN=await call('/api/versions/'+vid()+'/shuttle/demands',{method:'POST',headers:auth(),body:JSON.stringify(body)});
+    render();
+  }catch(e){alert(e.message)}
+  return false;
+}
+async function addTrip(){
+  try{
+    const stop_ids=[...$('tStops').selectedOptions].map(o=>+o.value);
+    const body={label:$('tLabel').value,crew:$('tCrew').value,start_minute:+$('tStart').value,end_minute:+$('tEnd').value,capacity:+$('tCap').value,stop_ids};
+    PLAN=await call('/api/versions/'+vid()+'/shuttle/trips',{method:'POST',headers:auth(),body:JSON.stringify(body)});
+    render();
+  }catch(e){alert(e.message)}
+  return false;
+}
+async function delDemand(id){try{PLAN=await call('/api/shuttle/demands/'+id,{method:'DELETE',headers:auth()});render()}catch(e){alert(e.message)}}
+async function delTrip(id){try{PLAN=await call('/api/shuttle/trips/'+id,{method:'DELETE',headers:auth()});render()}catch(e){alert(e.message)}}
+async function flow(name){try{$('flowOut').textContent=JSON.stringify(await call('/api/versions/'+vid()+'/'+name,{method:'POST',headers:auth(),body:'{}'}),null,2);await loadAll()}catch(e){$('flowOut').textContent=e.message}}
+async function showSnapshot(){try{const v=await call('/api/versions/'+vid());$('flowOut').textContent=v.snapshot?JSON.stringify(v.snapshot.shuttle??v.snapshot,null,2):'该版本还没有发布快照。'}catch(e){$('flowOut').textContent=e.message}}
+$('versionSel').addEventListener('change',loadPlan);
+loadAll();
+</script></body></html>

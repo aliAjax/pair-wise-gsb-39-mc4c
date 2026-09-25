@@ -20,6 +20,15 @@ python app.py --port 8010
 - 修改只允许发生在草稿版本；创建新版本会复制父版本变更，已发布快照继续保留。
 - 发布在一个 SQLite 事务内写入方案快照和 SHA-256，旧发布版本不会被覆盖。
 
+## 接驳计划台
+
+打开 <http://127.0.0.1:8010/shuttle.html>。规则、保存和页面分开：纯规则在 `shuttle_rules.py`，存储在 `shuttle_store.py`，页面在 `static/shuttle.html`。
+
+- 草稿版本登记站点人数需求（人数、可选服务时段、备注），并安排接驳班次（班次号、车组、服务时段、单班载客量、停靠站）。
+- 覆盖按停运/跳站变更形成的站点缺口计算；同一车组时段重叠的班次、站点没人覆盖或单班容量不够的需求都留在待确认并写明缺口。覆盖与缺口只统计已确认班次。
+- 版本发布时把已确认班次写进方案快照（待确认班次与缺口一并记录）；新版本复制草稿后继续编辑只影响新版本。
+- 数据落在同一 SQLite 库，重开后仍可按版本查看覆盖情况。
+
 ## API
 
 使用 `X-User`、`X-Role` 身份头，角色包括 `planner`、`editor`、`reviewer`、`admin`。
@@ -32,6 +41,9 @@ python app.py --port 8010
 - `GET /api/route?from=1&to=5&version_id=1&at_minute=1430&accessible=true`：查询路径、耗时和到达时间。
 - `GET /api/trips/{id}`：查看跨日班次各站时间。
 - `GET /api/import-errors`：查看被隔离的错误批次。
+- `GET /api/versions/{id}/shuttle`：查看该版本的接驳需求、班次、站点覆盖与缺口。
+- `POST /api/versions/{id}/shuttle/demands|trips`：在草稿版本登记需求或安排班次。
+- `PUT|DELETE /api/shuttle/demands/{id}`、`PUT|DELETE /api/shuttle/trips/{id}`：修改或删除（仅草稿版本）。
 
 ## 测试
 
@@ -39,4 +51,4 @@ python app.py --port 8010
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖基线/改道路径、版本复制与发布隔离、审批冲突、无障碍路径、跨日时刻和坏数据整批隔离。
+测试覆盖基线/改道路径、版本复制与发布隔离、审批冲突、无障碍路径、跨日时刻和坏数据整批隔离；接驳部分覆盖车组时段重叠、站点没人覆盖、单班容量缺口、发布快照只含已确认班次、草稿隔离和重开后按版本查看。

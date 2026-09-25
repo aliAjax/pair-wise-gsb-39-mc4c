@@ -14,6 +14,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from errors import DomainError
+from shuttle_store import ShuttleStore
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "transit_disruption.db"
 
@@ -42,16 +45,20 @@ def _within_window(value: int, start: int | None, end: int | None) -> bool:
     return start <= value <= end
 
 
-class DomainError(Exception):
-    def __init__(self, message: str, status: int = 400):
-        super().__init__(message)
-        self.status = status
-
-
 class Database:
     def __init__(self, path: str | os.PathLike[str] = DEFAULT_DB):
         self.path = str(path)
+        self._version_copy_hooks: list[Any] = []
+        self._snapshot_hooks: list[Any] = []
         self._init_schema()
+
+    def register_version_copy_hook(self, hook: Any) -> None:
+        """版本复制时追加复制其它数据，钩子在同一事务内执行。"""
+        self._version_copy_hooks.append(hook)
+
+    def register_snapshot_hook(self, hook: Any) -> None:
+        """发布时向快照追加内容，钩子在同一事务内执行。"""
+        self._snapshot_hooks.append(hook)
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=10)
@@ -291,6 +298,8 @@ class Database:
                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (new_id, change["kind"], change["line_id"], change["stop_id"], change["from_stop_id"], change["to_stop_id"], change["travel_minutes"], change["effective_start_minute"], change["effective_end_minute"], change["accessible"], change["payload"], utcnow()),
                 )
+            for hook in self._version_copy_hooks:
+                hook(conn, parent_id, new_id)
             self._audit(conn, actor, "version.copied", "version", new_id, {"parent_id": parent_id})
             return dict(conn.execute("SELECT * FROM versions WHERE id=?", (new_id,)).fetchone())
 
@@ -376,6 +385,8 @@ class Database:
                     raise DomainError("只有已批准版本可以发布", 409)
                 changes = [dict(r) for r in conn.execute("SELECT kind,line_id,stop_id,from_stop_id,to_stop_id,travel_minutes,effective_start_minute,effective_end_minute,accessible,payload FROM changes WHERE version_id=? ORDER BY id", (version_id,)).fetchall()]
                 snapshot = {"version_id": version_id, "disruption_id": version["disruption_id"], "version_no": version["version_no"], "changes": changes, "base_hash": self._base_hash(conn)}
+                for hook in self._snapshot_hooks:
+                    snapshot.update(hook(conn, version_id) or {})
                 snapshot_text = canonical(snapshot)
                 digest = hashlib.sha256(snapshot_text.encode()).hexdigest()
                 conn.execute("UPDATE versions SET status='published',snapshot_hash=?,snapshot=?,published_at=?,updated_at=? WHERE id=?", (digest, snapshot_text, utcnow(), utcnow(), version_id))
@@ -579,6 +590,7 @@ def seed_demo(db: Database) -> dict[str, int]:
 
 class Handler(BaseHTTPRequestHandler):
     db: Database
+    shuttle: ShuttleStore
     server_version = "TransitDisruption/1.0"
 
     def _send(self, payload: Any, status: int = 200) -> None:
@@ -589,8 +601,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _html(self) -> None:
-        data = (ROOT / "static" / "index.html").read_bytes()
+    def _html(self, page: str = "index.html") -> None:
+        data = (ROOT / "static" / page).read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
@@ -614,6 +626,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if parsed.path in {"/", "/index.html"}:
                 return self._html()
+            if parsed.path in {"/shuttle", "/shuttle.html"}:
+                return self._html("shuttle.html")
             if parsed.path == "/api/health":
                 return self._send({"ok": True})
             endpoints = {
@@ -630,6 +644,8 @@ class Handler(BaseHTTPRequestHandler):
             parts = [p for p in parsed.path.split("/") if p]
             if len(parts) == 3 and parts[:2] == ["api", "versions"]:
                 return self._send(self.db.get_version(int(parts[2])))
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "shuttle":
+                return self._send(self.shuttle.get_plan(int(parts[2])))
             if len(parts) == 3 and parts[:2] == ["api", "trips"]:
                 return self._send({"times": self.db.trip_times(int(parts[2]))})
             if parsed.path == "/api/route":
@@ -657,14 +673,70 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(self.db.add_change(int(body.get("version_id")), actor, body, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "changes":
                 return self._send(self.db.add_change(int(parts[2]), actor, body, role), 201)
+            if len(parts) == 5 and parts[:2] == ["api", "versions"] and parts[3] == "shuttle" and parts[4] == "demands":
+                return self._send(self.shuttle.add_demand(int(parts[2]), body, actor, role), 201)
+            if len(parts) == 5 and parts[:2] == ["api", "versions"] and parts[3] == "shuttle" and parts[4] == "trips":
+                return self._send(self.shuttle.add_trip(int(parts[2]), body, actor, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] in {"submit", "approve", "reject", "publish"}:
                 return self._send(self.db.transition(int(parts[2]), actor, role, parts[3]))
             raise DomainError("接口不存在", 404)
         except (ValueError, TypeError, DomainError) as exc:
             self._send({"error": str(exc)}, getattr(exc, "status", 400))
 
+    def do_PUT(self) -> None:
+        parsed = urlparse(self.path)
+        try:
+            actor, role = self._auth()
+            body = self._body()
+            parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) == 4 and parts[:2] == ["api", "shuttle"] and parts[2] == "demands":
+                return self._send(self.shuttle.update_demand(int(parts[3]), body, actor, role))
+            if len(parts) == 4 and parts[:2] == ["api", "shuttle"] and parts[2] == "trips":
+                return self._send(self.shuttle.update_trip(int(parts[3]), body, actor, role))
+            raise DomainError("接口不存在", 404)
+        except (ValueError, TypeError, DomainError) as exc:
+            self._send({"error": str(exc)}, getattr(exc, "status", 400))
+
+    def do_DELETE(self) -> None:
+        parsed = urlparse(self.path)
+        try:
+            actor, role = self._auth()
+            parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) == 4 and parts[:2] == ["api", "shuttle"] and parts[2] == "demands":
+                return self._send(self.shuttle.delete_demand(int(parts[3]), actor, role))
+            if len(parts) == 4 and parts[:2] == ["api", "shuttle"] and parts[2] == "trips":
+                return self._send(self.shuttle.delete_trip(int(parts[3]), actor, role))
+            raise DomainError("接口不存在", 404)
+        except (ValueError, TypeError, DomainError) as exc:
+            self._send({"error": str(exc)}, getattr(exc, "status", 400))
+
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"[transit] {self.address_string()} - {fmt % args}")
+
+
+def seed_shuttle_demo(db: Database, shuttle: ShuttleStore) -> None:
+    """导入一个带缺口与冲突的接驳计划示例，打开计划台即可看到效果。"""
+    if db.list_disruptions():
+        return
+    stops = {row["code"]: int(row["id"]) for row in db.list_stops()}
+    disruption = db.create_disruption("planner-01", {"code": "D-DEMO", "name": "南门码头区间夜间停运",
+                                                    "starts_at": "2026-09-25T18:00:00+08:00",
+                                                    "ends_at": "2026-09-26T02:00:00+08:00"}, "planner")
+    version_id = disruption["draft_version_id"]
+    db.add_change(version_id, "planner-01", {"kind": "stop_closure", "stop_id": stops["S3"],
+                                             "effective_start_minute": 1080, "effective_end_minute": 1560}, "planner")
+    db.add_change(version_id, "planner-01", {"kind": "stop_closure", "stop_id": stops["S4"],
+                                             "effective_start_minute": 1080, "effective_end_minute": 1560}, "planner")
+    shuttle.add_demand(version_id, {"stop_id": stops["S3"], "needed": 120,
+                                    "start_minute": 1080, "end_minute": 1320, "note": "晚高峰换乘客流"}, "planner-01", "planner")
+    shuttle.add_demand(version_id, {"stop_id": stops["S4"], "needed": 80,
+                                    "start_minute": 1080, "end_minute": 1560, "note": "码头末班客流"}, "planner-01", "planner")
+    shuttle.add_trip(version_id, {"label": "接驳-1", "crew": "车组A", "start_minute": 1080, "end_minute": 1440,
+                                  "capacity": 60, "stop_ids": [stops["S2"], stops["S3"], stops["S4"]]}, "planner-01", "planner")
+    shuttle.add_trip(version_id, {"label": "接驳-2", "crew": "车组A", "start_minute": 1200, "end_minute": 1560,
+                                  "capacity": 60, "stop_ids": [stops["S3"], stops["S4"], stops["S5"]]}, "planner-01", "planner")
+    shuttle.add_trip(version_id, {"label": "接驳-3", "crew": "车组B", "start_minute": 1080, "end_minute": 1560,
+                                  "capacity": 45, "stop_ids": [stops["S3"], stops["S4"]]}, "planner-01", "planner")
 
 
 def main() -> None:
@@ -674,11 +746,14 @@ def main() -> None:
     parser.add_argument("--init", action="store_true", help="创建数据库并导入示例线路")
     args = parser.parse_args()
     db = Database(args.db)
+    shuttle = ShuttleStore(db)
     if args.init:
         seed = seed_demo(db)
+        seed_shuttle_demo(db, shuttle)
         print(f"initialized database at {args.db}; line={seed['line']}")
         return
     Handler.db = db
+    Handler.shuttle = shuttle
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print(f"transit-disruption listening on http://127.0.0.1:{args.port} (db={args.db})")
     server.serve_forever()
